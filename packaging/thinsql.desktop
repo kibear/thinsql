@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ThinSQL
+GenericName=Database Client
+Comment=Lightweight database client for MySQL and PostgreSQL
+Exec=thinsql-app
+Terminal=false
+Categories=Development;Database;
+StartupNotify=true
+# 必须与 X11 的 WM_CLASS 中的 class 一致，否则任务栏无法归组
+StartupWMClass=ThinSQL

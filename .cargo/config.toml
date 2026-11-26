@@ -1,0 +1,15 @@
+# Linux 构建环境说明
+#
+# 1) 本机（以及多数精简发行版/容器）未安装 fontconfig 开发包，pkg-config 找不到
+#    fontconfig.pc，yeslogic-fontconfig-sys 的构建脚本会直接 panic。
+#    该 crate 支持运行时 dlopen，只要系统里有 libfontconfig.so.1 即可工作，
+#    因此这里强制走 dlopen 路径，避免要求 root 安装 -dev 包。
+#
+# 2) gpui 通过 xkbcommon crate 链接 libxkbcommon，而链接需要开发用的
+#    libxkbcommon.so 软链。scripts/dev-setup-linux.sh 会在 native/lib 下
+#    建立指向系统运行时库的软链，这里把该目录加入链接搜索路径。
+[env]
+RUST_FONTCONFIG_DLOPEN = "1"
+
+[build]
+rustflags = ["-L", "native/lib"]

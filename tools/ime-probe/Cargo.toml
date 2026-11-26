@@ -1,0 +1,8 @@
+[package]
+name = "ime-probe"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }

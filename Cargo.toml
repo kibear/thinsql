@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/thinsql-core", "crates/thinsql-app", "tools/ime-probe"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+gpui-kit = "=0.11.0"
+thinsql-core = { path = "crates/thinsql-core" }
+
+[profile.release]
+# 体积优先：fat LTO + 单 codegen unit 通常能再省 15~20%
+lto = "fat"
+codegen-units = 1
+strip = true
