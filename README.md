@@ -23,11 +23,32 @@ Most database IDEs ship a browser engine or a JVM. ThinSQL is a **single native 
 - Query history; export results to **CSV** / **JSON**
 - Read-only connection mode; passwords stored in the OS keyring
 - UI language: **Chinese** / **English**
-## Screenshot
-<!-- Add a real screenshot when available, e.g.:
-![ThinSQL main window](docs/images/screenshot.png)
--->
-_Screenshot coming soon._
+## Screenshots
+
+SQL editor + results:
+
+![SQL query workspace](capture/query.png)
+
+Table data preview:
+
+![Table data browser](capture/data.png)
+
+New connection (MySQL / PostgreSQL):
+
+![New connection dialog](capture/index.png)
+
+Table structure — columns:
+
+![Column editor](capture/ddl_column.png)
+
+Table structure — indexes:
+
+![Index editor](capture/ddl_index.png)
+
+Settings (theme, language, fonts, paging):
+
+![Settings dialog](capture/settings.png)
+
 ## Status
 Early preview (`0.1.0`). APIs and UI can change. Linux (X11) is the primary development target today.
 ## Build from source (Linux)
@@ -81,6 +102,11 @@ Suggested topics:
 - 查询历史；结果导出 **CSV** / **JSON**
 - 只读连接；密码走系统钥匙串
 - 界面语言：中文 / 英文
+
+### 截图
+
+见上方 [Screenshots](#screenshots)。
+
 ### 从源码构建（Linux）
 ```bash
 ./scripts/dev-setup-linux.sh   # 首次必须
