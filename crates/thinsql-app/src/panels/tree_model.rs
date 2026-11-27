@@ -242,7 +242,7 @@ fn navigator_kinds_for_conn(conn: &ConnEntry) -> &'static [ObjectKind] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thinsql_core::model::{ConnectionConfig, DriverKind, ObjectKind};
+    use thinsql_core::model::{ConnectionConfig, DriverKind, ObjectKind, TableRef};
     use crate::state::ConnEntry;
 
     fn connected_conn() -> ConnEntry {

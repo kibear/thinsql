@@ -12,6 +12,7 @@ keyring = "4"
 # 本机没有 OpenSSL 开发文件，必须用 rustls（ring 后端），否则编译失败
 mysql = { version = "28", features = ["rustls-tls-ring"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+rust_xlsxwriter = "0.104"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

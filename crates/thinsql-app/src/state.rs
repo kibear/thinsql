@@ -128,6 +128,7 @@ pub enum ExportFormat {
     Csv,
     Json,
     Insert,
+    Xlsx,
 }
 
 impl ExportFormat {
@@ -136,8 +137,51 @@ impl ExportFormat {
             Self::Csv => "csv",
             Self::Json => "json",
             Self::Insert => "sql",
+            Self::Xlsx => "xlsx",
         }
     }
+}
+
+fn export_suggested_name(stem: &str, ext: &str) -> String {
+    let mut base: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    while base.starts_with('_') {
+        base.remove(0);
+    }
+    if base.is_empty() {
+        base = "export".into();
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{base}-{stamp}.{ext}")
+}
+
+fn with_export_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(existing) if existing.eq_ignore_ascii_case(ext) => path,
+        _ => {
+            path.set_extension(ext);
+            path
+        }
+    }
+}
+
+/// 复制到剪贴板的格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormat {
+    Insert,
+    InsertWithoutPk,
+    Csv,
 }
 
 /// 一次单元格编辑的上下文：定位该行需要主键，回写时也靠它。
@@ -1541,6 +1585,100 @@ impl AppState {
         );
     }
 
+    /// 按结果行下标批量暂存删除；无主键或定位失败时返回错误，不改动 pending。
+    pub fn stage_delete_rows(
+        &mut self,
+        tab_id: TabId,
+        row_indices: &[usize],
+    ) -> Result<(), String> {
+        if row_indices.is_empty() {
+            return Err(t("请先选中行").into());
+        }
+        let Some(tab) = self.tab(tab_id) else {
+            return Err(t("标签已关闭").into());
+        };
+        let Some(entry) = tab.conn_id.as_deref().and_then(|id| self.entry(id)) else {
+            return Err(t("请先连接一个数据库").into());
+        };
+        if entry.cfg.read_only {
+            return Err(t("当前连接是只读模式，请先关闭只读再编辑").into());
+        }
+        if tab.current_pk.is_empty() {
+            return Err(t("该表没有主键，无法安全定位要修改的行").into());
+        }
+        let result = tab
+            .result
+            .as_ref()
+            .ok_or_else(|| t("还没有结果集").to_string())?;
+
+        let mut keys = Vec::with_capacity(row_indices.len());
+        for &row_ix in row_indices {
+            let row = result
+                .rows
+                .get(row_ix)
+                .ok_or_else(|| t("行不存在").to_string())?;
+            keys.push(thinsql_core::edit::locate_key(
+                &tab.current_pk,
+                &result.columns,
+                row,
+            )?);
+        }
+        for key in keys {
+            self.stage_delete(tab_id, key);
+        }
+        Ok(())
+    }
+
+    /// 把选中行格式化为可复制文本。`row_indices` 为空则失败。
+    pub fn format_copy_rows(
+        &self,
+        tab_id: TabId,
+        format: CopyFormat,
+        row_indices: &[usize],
+    ) -> Result<String, String> {
+        if row_indices.is_empty() {
+            return Err(t("请先选中行").into());
+        }
+        let Some(tab) = self.tab(tab_id) else {
+            return Err(t("标签已关闭").into());
+        };
+        let Some(result) = tab.result.as_ref() else {
+            return Err(t("还没有结果集").into());
+        };
+        let rows = export::select_rows(&result.rows, row_indices);
+        if rows.is_empty() {
+            return Err(t("结果为空，没有可导出的内容").into());
+        }
+        let escape = match tab
+            .conn_id
+            .as_deref()
+            .and_then(|id| self.entry(id))
+            .map(|entry| entry.cfg.kind)
+        {
+            Some(DriverKind::MySql) => thinsql_core::provider::EscapeStyle::Backslash,
+            _ => thinsql_core::provider::EscapeStyle::Standard,
+        };
+        let table = tab
+            .table
+            .as_ref()
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "table".to_string());
+        let text = match format {
+            CopyFormat::Csv => export::to_csv(&result.columns, &rows),
+            CopyFormat::Insert => {
+                export::to_insert(&table, &result.columns, &rows, escape, &[])
+            }
+            CopyFormat::InsertWithoutPk => {
+                let exclude: Vec<&str> = tab.current_pk.iter().map(String::as_str).collect();
+                export::to_insert(&table, &result.columns, &rows, escape, &exclude)
+            }
+        };
+        if text.trim().is_empty() {
+            return Err(t("结果为空，没有可导出的内容").into());
+        }
+        Ok(text)
+    }
+
     pub fn discard_changes(&mut self, tab_id: TabId) {
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.pending_changes.clear();
@@ -1719,8 +1857,15 @@ impl AppState {
 
     /// 导出指定标签已加载的结果到文件（HOME 下的 thinsql-export-*）。
     ///
-    /// 结果格式化与写盘都放到后台执行器：大结果导出不再卡住 UI。
-    pub fn export(&mut self, tab_id: TabId, format: ExportFormat, cx: &mut Context<Self>) {
+    /// `row_indices` 为 `Some` 时只导出这些行；`None` 导出当前已加载的全部行。
+    /// 先弹系统「另存为」对话框选路径，再在后台格式化与写盘。
+    pub fn export(
+        &mut self,
+        tab_id: TabId,
+        format: ExportFormat,
+        row_indices: Option<&[usize]>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tab(tab_id) else {
             return;
         };
@@ -1743,37 +1888,78 @@ impl AppState {
             .as_ref()
             .map(|t| t.to_string())
             .unwrap_or_else(|| "table".to_string());
+        let stem = tab
+            .table
+            .as_ref()
+            .map(|t| t.name.as_str())
+            .unwrap_or("query");
         let columns = result.columns.clone();
-        let rows = result.rows.clone();
+        let rows = match row_indices {
+            Some(indices) => export::select_rows(&result.rows, indices),
+            None => result.rows.clone(),
+        };
 
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let dir = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let path = std::path::Path::new(&dir)
-            .join(format!("thinsql-export-{stamp}.{}", format.extension()));
-
-        self.set_tab_status(
-            tab_id,
-            tr("正在导出：{path}", &[("path", &path.display().to_string())]),
-        );
-
-        let export_task = cx.background_executor().spawn(async move {
-            let text = match format {
-                ExportFormat::Csv => export::to_csv(&columns, &rows),
-                ExportFormat::Json => export::to_json(&columns, &rows),
-                ExportFormat::Insert => export::to_insert(&table, &columns, &rows, escape),
-            };
-            if text.trim().is_empty() {
-                return Err(t("结果为空，没有可导出的内容").to_string());
-            }
-            std::fs::write(&path, text.as_bytes())
-                .map(|()| path)
-                .map_err(|err| err.to_string())
-        });
+        let suggested = export_suggested_name(stem, format.extension());
+        let dir = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path_rx = cx.prompt_for_new_path(&dir, Some(&suggested));
 
         cx.spawn(async move |this, cx| {
+            let path = match path_rx.await {
+                Ok(Ok(Some(path))) => with_export_extension(path, format.extension()),
+                Ok(Ok(None)) => return,
+                Ok(Err(err)) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.set_tab_status(
+                            tab_id,
+                            tr("导出失败：{error}", &[("error", &err.to_string())]),
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => return,
+            };
+
+            let _ = this.update(cx, |state, cx| {
+                state.set_tab_status(
+                    tab_id,
+                    tr("正在导出：{path}", &[("path", &path.display().to_string())]),
+                );
+                cx.notify();
+            });
+
+            let export_task = cx.background_executor().spawn(async move {
+                match format {
+                    ExportFormat::Xlsx => {
+                        let bytes = export::to_xlsx(&columns, &rows)?;
+                        if bytes.is_empty() {
+                            return Err(t("结果为空，没有可导出的内容").to_string());
+                        }
+                        std::fs::write(&path, bytes)
+                            .map(|()| path)
+                            .map_err(|err| err.to_string())
+                    }
+                    other => {
+                        let text = match other {
+                            ExportFormat::Csv => export::to_csv(&columns, &rows),
+                            ExportFormat::Json => export::to_json(&columns, &rows),
+                            ExportFormat::Insert => {
+                                export::to_insert(&table, &columns, &rows, escape, &[])
+                            }
+                            ExportFormat::Xlsx => unreachable!(),
+                        };
+                        if text.trim().is_empty() {
+                            return Err(t("结果为空，没有可导出的内容").to_string());
+                        }
+                        std::fs::write(&path, text.as_bytes())
+                            .map(|()| path)
+                            .map_err(|err| err.to_string())
+                    }
+                }
+            });
+
             let outcome = export_task.await;
             let _ = this.update(cx, |state, cx| {
                 state.set_tab_status(

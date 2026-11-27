@@ -3,12 +3,13 @@
 //! 每个标签一个实例，持有自己的表格状态与编辑上下文；数据用 Arc 共享，
 //! 版本号变化时才把结果交给表格代理，不在每帧克隆行数据。
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use gpui_kit::base::StyledExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::theme::ActiveTheme;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -20,8 +21,8 @@ use thinsql_core::value::value_from_input;
 
 use crate::i18n::{t, tr};
 use crate::state::{
-    AppState, EditTarget, ExportFormat, RowPendingKind, StatementStatus, TabId, pending_cell_value,
-    row_pending_kind,
+    AppState, CopyFormat, EditTarget, ExportFormat, RowPendingKind, StatementStatus, TabId,
+    pending_cell_value, row_pending_kind,
 };
 
 pub struct ResultDelegate {
@@ -31,6 +32,12 @@ pub struct ResultDelegate {
     summary: String,
     editing_cell: Option<(usize, usize)>,
     cell_input: Option<Entity<InputState>>,
+    /// 自管多行选中（gpui-kit Table 仅单选）。
+    selected_rows: BTreeSet<usize>,
+    /// Shift 区间选中的锚点。
+    selection_anchor: Option<usize>,
+    /// Ctrl/Shift 点击后忽略紧随的 TableEvent::Select*，避免冲掉多选。
+    ignore_next_table_select: bool,
 }
 
 impl ResultDelegate {
@@ -42,10 +49,15 @@ impl ResultDelegate {
             summary: t("尚无结果").into(),
             editing_cell: None,
             cell_input: None,
+            selected_rows: BTreeSet::new(),
+            selection_anchor: None,
+            ignore_next_table_select: false,
         }
     }
 
     fn load(&mut self, result: Option<Arc<QueryResult>>) {
+        self.selected_rows.clear();
+        self.selection_anchor = None;
         self.summary = match result.as_ref() {
             None => t("尚无结果").into(),
             Some(result) => match result.affected_rows {
@@ -87,11 +99,50 @@ impl ResultDelegate {
         let key = locate_key(&tab.current_pk, &result.columns, row).ok()?;
         row_pending_kind(&tab.pending_changes, &key)
     }
+
+    fn selected_indices(&self) -> Vec<usize> {
+        self.selected_rows.iter().copied().collect()
+    }
+
+    fn select_only(&mut self, row_ix: usize) {
+        self.selected_rows.clear();
+        self.selected_rows.insert(row_ix);
+        self.selection_anchor = Some(row_ix);
+    }
+
+    fn apply_row_click(&mut self, row_ix: usize, secondary: bool, shift: bool) {
+        if shift {
+            let anchor = self.selection_anchor.unwrap_or(row_ix);
+            let (lo, hi) = if anchor <= row_ix {
+                (anchor, row_ix)
+            } else {
+                (row_ix, anchor)
+            };
+            self.selected_rows.clear();
+            self.selected_rows.extend(lo..=hi);
+            self.ignore_next_table_select = true;
+        } else if secondary {
+            if !self.selected_rows.remove(&row_ix) {
+                self.selected_rows.insert(row_ix);
+            }
+            self.selection_anchor = Some(row_ix);
+            self.ignore_next_table_select = true;
+        } else {
+            self.select_only(row_ix);
+        }
+    }
+
+    fn ensure_row_selected(&mut self, row_ix: usize) {
+        if !self.selected_rows.contains(&row_ix) {
+            self.select_only(row_ix);
+        }
+    }
 }
 
 impl TableDelegate for ResultDelegate {
     fn columns_count(&self, _: &App) -> usize {
-        self.result().map(|r| r.columns.len()).unwrap_or(0)
+        // +1：左侧加宽的行手柄列，方便右键（kit 自带 row header 过窄）
+        self.result().map(|r| r.columns.len() + 1).unwrap_or(0)
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -99,12 +150,21 @@ impl TableDelegate for ResultDelegate {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
+        if col_ix == 0 {
+            return Column::new("_row", "")
+                .width(px(48.))
+                .resizable(false)
+                .movable(false)
+                .selectable(false)
+                .fixed_left();
+        }
+        let data_ix = col_ix - 1;
         let name = self
             .result()
-            .and_then(|r| r.columns.get(col_ix))
+            .and_then(|r| r.columns.get(data_ix))
             .map(|c: &ResultColumn| c.name.clone())
             .unwrap_or_default();
-        Column::new(format!("c{col_ix}"), name)
+        Column::new(format!("c{data_ix}"), name)
             .width(px(160.))
             .resizable(true)
     }
@@ -115,51 +175,51 @@ impl TableDelegate for ResultDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
+        let selected = self.selected_rows.contains(&row_ix);
         let kind = self.pending_kind_for_row(row_ix, cx);
-        let mut row = div().id(("row", row_ix));
-        match kind {
-            Some(RowPendingKind::Deleted) => {
-                row = row
-                    .bg(cx.theme().danger.opacity(0.12))
-                    .text_color(cx.theme().muted_foreground);
+        let mut row = div().id(("row", row_ix)).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |table, event: &MouseDownEvent, _, cx| {
+                let modifiers = event.modifiers;
+                let secondary = modifiers.secondary(cx);
+                let shift = modifiers.shift;
+                table.delegate_mut().apply_row_click(row_ix, secondary, shift);
+                table.refresh(cx);
+                cx.notify();
+            }),
+        );
+        if selected {
+            row = row.bg(cx.theme().primary.opacity(0.18));
+        } else {
+            match kind {
+                Some(RowPendingKind::Deleted) => {
+                    row = row
+                        .bg(cx.theme().danger.opacity(0.12))
+                        .text_color(cx.theme().muted_foreground);
+                }
+                Some(RowPendingKind::Modified) => {
+                    row = row.bg(cx.theme().warning.opacity(0.12));
+                }
+                None => {}
             }
-            Some(RowPendingKind::Modified) => {
-                row = row.bg(cx.theme().warning.opacity(0.12));
-            }
-            None => {}
         }
         row
     }
 
-    /// 数据网格行右键：删除整行。删除先进暂存区，与单元格修改共用
-    /// 同一份 SQL 预览与单事务提交流程。
+    /// 行头右键：与单元格右键共用同一套菜单。
     fn context_menu(
         &mut self,
         row_ix: usize,
         menu: PopupMenu,
-        _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
+        self.ensure_row_selected(row_ix);
+        let indices = self.selected_indices();
         let state = self.state.clone();
         let tab = self.tab;
-        menu.item(PopupMenuItem::new(t("删除行")).on_click(move |_, _, app| {
-            // start_edit 只做前置校验与主键定位，这里借用它的 key，不进入编辑态
-            let outcome = state.update(app, |state, cx| {
-                let result = state.start_edit(tab, row_ix, 0).map(|target| target.key);
-                cx.notify();
-                result
-            });
-            match outcome {
-                Ok(key) => state.update(app, |state, cx| {
-                    state.stage_delete(tab, key);
-                    cx.notify();
-                }),
-                Err(message) => state.update(app, |state, cx| {
-                    state.set_tab_status(tab, message);
-                    cx.notify();
-                }),
-            }
-        }))
+        cx.notify();
+        fill_selection_menu(menu, window, cx, state, tab, indices)
     }
 
     fn render_td(
@@ -169,7 +229,42 @@ impl TableDelegate for ResultDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        if self.editing_cell == Some((row_ix, col_ix))
+        let table = cx.entity();
+        let state = self.state.clone();
+        let tab = self.tab;
+        let cell_id = format!("cell-{row_ix}-{col_ix}");
+        let with_menu = |cell: Div| {
+            cell.id(cell_id.clone())
+                .context_menu(move |menu, window, menu_cx| {
+                    table.update(menu_cx, |table, cx| {
+                        table.delegate_mut().ensure_row_selected(row_ix);
+                        table.refresh(cx);
+                    });
+                    let indices = table.read(menu_cx).delegate().selected_indices();
+                    fill_selection_menu(menu, window, menu_cx, state.clone(), tab, indices)
+                })
+        };
+
+        if col_ix == 0 {
+            // 加宽行手柄：显示行号，整格可右键
+            let label = (row_ix + 1).to_string();
+            return with_menu(
+                div()
+                    .px_1()
+                    .w_full()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            .into_any_element();
+        }
+
+        let data_ix = col_ix - 1;
+        if self.editing_cell == Some((row_ix, data_ix))
             && let Some(input) = self.cell_input.as_ref()
         {
             return div()
@@ -179,16 +274,16 @@ impl TableDelegate for ResultDelegate {
                 .into_any_element();
         }
 
-        let value = self.display_value(row_ix, col_ix, cx);
+        let value = self.display_value(row_ix, data_ix, cx);
         let is_null = value.is_null();
         let text = value.display();
 
-        let mut cell = div().px_2().min_w_0().child(text);
+        let mut cell = div().px_2().min_w_0().w_full().h_full().child(text);
         if is_null {
             // NULL 用弱化色区分，避免和字面量字符串 "NULL" 混淆
             cell = cell.text_color(cx.theme().muted_foreground);
         }
-        cell.into_any_element()
+        with_menu(cell).into_any_element()
     }
 }
 
@@ -251,6 +346,8 @@ impl ResultsView {
         let table = cx.new(|cx| {
             TableState::new(ResultDelegate::new(state.clone(), tab), window, cx)
                 .cell_selectable(true)
+                .row_selectable(true)
+                .select_on_modifier_click(false)
         });
         let sub_state = cx.observe(&state, |this, _state, cx| {
             this.sync(cx);
@@ -268,10 +365,31 @@ impl ResultsView {
                 .placeholder(t("筛选条件，例如 id > 10"))
                 .default_value(initial_filter)
         });
-        let sub_table = cx.subscribe(&table, |this, _table, event: &TableEvent, cx| {
-            if let TableEvent::DoubleClickedCell(row, col) = event {
-                this.edit_request = Some((*row, *col));
-                cx.notify();
+        let sub_table = cx.subscribe(&table, |this, table, event: &TableEvent, cx| {
+            match event {
+                TableEvent::DoubleClickedCell(row, col) => {
+                    // 第 0 列是行手柄，不可编辑
+                    if *col == 0 {
+                        return;
+                    }
+                    this.edit_request = Some((*row, *col - 1));
+                    cx.notify();
+                }
+                TableEvent::SelectRow(row) | TableEvent::SelectCell(row, _) => {
+                    let row = *row;
+                    table.update(cx, |table, cx| {
+                        let delegate = table.delegate_mut();
+                        if delegate.ignore_next_table_select {
+                            delegate.ignore_next_table_select = false;
+                            return;
+                        }
+                        // 无修饰键的表格原生选中：与自管多选对齐为单行
+                        delegate.select_only(row);
+                        table.refresh(cx);
+                    });
+                    cx.notify();
+                }
+                _ => {}
             }
         });
         let sub_cell = cx.subscribe(&cell_input, |this, _input, event: &InputEvent, cx| {
@@ -421,13 +539,14 @@ impl ResultsView {
             for (label, format) in [
                 ("导出 CSV", ExportFormat::Csv),
                 ("导出 JSON", ExportFormat::Json),
-                ("导出 INSERT", ExportFormat::Insert),
+                ("导出 SQL", ExportFormat::Insert),
+                ("导出 Excel", ExportFormat::Xlsx),
             ] {
                 let label = t(label);
                 let state = state.clone();
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, app| {
                     state.update(app, |state, cx| {
-                        state.export(tab, format, cx);
+                        state.export(tab, format, None, cx);
                         cx.notify();
                     });
                 }));
@@ -435,6 +554,94 @@ impl ResultsView {
             menu
         }
     }
+}
+
+/// 选中行的右键菜单：复制 / 导出为二级菜单，删除为单项。
+fn fill_selection_menu(
+    menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut App,
+    state: Entity<AppState>,
+    tab: TabId,
+    indices: Vec<usize>,
+) -> PopupMenu {
+    let copy_sub = {
+        let state = state.clone();
+        let indices = indices.clone();
+        PopupMenu::build(window, cx, move |menu, _, _| {
+            let mut menu = menu;
+            for (label, format) in [
+                ("复制 INSERT", CopyFormat::Insert),
+                ("复制 INSERT（不含主键）", CopyFormat::InsertWithoutPk),
+                ("复制 CSV", CopyFormat::Csv),
+            ] {
+                let state = state.clone();
+                let indices = indices.clone();
+                menu = menu.item(PopupMenuItem::new(t(label)).on_click(move |_, _, app| {
+                    let outcome = state.read(app).format_copy_rows(tab, format, &indices);
+                    match outcome {
+                        Ok(text) => {
+                            app.write_to_clipboard(ClipboardItem::new_string(text));
+                            state.update(app, |state, cx| {
+                                state.set_tab_status(
+                                    tab,
+                                    tr("已复制 {n} 行", &[("n", &indices.len().to_string())]),
+                                );
+                                cx.notify();
+                            });
+                        }
+                        Err(message) => state.update(app, |state, cx| {
+                            state.set_tab_status(tab, message);
+                            cx.notify();
+                        }),
+                    }
+                }));
+            }
+            menu
+        })
+    };
+
+    let export_sub = {
+        let state = state.clone();
+        let indices = indices.clone();
+        PopupMenu::build(window, cx, move |menu, _, _| {
+            let mut menu = menu;
+            for (label, format) in [
+                ("导出 SQL", ExportFormat::Insert),
+                ("导出 CSV", ExportFormat::Csv),
+                ("导出 Excel", ExportFormat::Xlsx),
+            ] {
+                let state = state.clone();
+                let indices = indices.clone();
+                menu = menu.item(PopupMenuItem::new(t(label)).on_click(move |_, _, app| {
+                    state.update(app, |state, cx| {
+                        state.export(tab, format, Some(&indices), cx);
+                        cx.notify();
+                    });
+                }));
+            }
+            menu
+        })
+    };
+
+    let mut menu = menu
+        .item(PopupMenuItem::submenu(t("复制"), copy_sub))
+        .item(PopupMenuItem::submenu(t("导出"), export_sub))
+        .item(PopupMenuItem::separator());
+    {
+        let state = state.clone();
+        let indices = indices.clone();
+        menu = menu.item(PopupMenuItem::new(t("删除选中行")).on_click(move |_, _, app| {
+            state.update(app, |state, cx| {
+                match state.stage_delete_rows(tab, &indices) {
+                    Ok(()) => {}
+                    Err(message) => state.set_tab_status(tab, message),
+                }
+                cx.notify();
+            });
+        }));
+    }
+    menu
 }
 
 impl Render for ResultsView {

@@ -1,9 +1,44 @@
 //! 结果集导出。纯函数，不碰文件系统，便于单测。
 //!
-//! 三种格式各有取舍：CSV 给人看、JSON 给程序吃、INSERT 用来搬到另一个库。
+//! CSV 给人看、JSON 给程序吃、INSERT/XLSX 用来搬到另一个库或表格工具。
 
 use crate::model::ResultColumn;
 use crate::value::{EscapeStyle, Value, sql_literal};
+
+/// 按行下标取出子集；越界下标忽略。
+pub fn select_rows(rows: &[Vec<Value>], indices: &[usize]) -> Vec<Vec<Value>> {
+    indices
+        .iter()
+        .filter_map(|&ix| rows.get(ix).cloned())
+        .collect()
+}
+
+/// 去掉指定列名（如主键），返回新的列与行。`exclude` 为空时原样克隆。
+pub fn without_columns(
+    columns: &[ResultColumn],
+    rows: &[Vec<Value>],
+    exclude: &[&str],
+) -> (Vec<ResultColumn>, Vec<Vec<Value>>) {
+    if exclude.is_empty() {
+        return (columns.to_vec(), rows.to_vec());
+    }
+    let keep: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !exclude.iter().any(|name| name == &c.name))
+        .map(|(ix, _)| ix)
+        .collect();
+    let new_columns = keep.iter().map(|&ix| columns[ix].clone()).collect();
+    let new_rows = rows
+        .iter()
+        .map(|row| {
+            keep.iter()
+                .map(|&ix| row.get(ix).cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect();
+    (new_columns, new_rows)
+}
 
 /// CSV：字段含逗号/引号/换行时用双引号包裹，内部引号翻倍。
 /// NULL 导出为空串（CSV 没有 null 概念），这是导入端最容易出错的点，README 需注明。
@@ -99,14 +134,17 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// INSERT 语句，用于把结果搬到另一个库。表名由调用方给出（含引用符）。
+/// INSERT 语句。`exclude` 为要剔除的列名（如主键）；空切片表示保留全部列。
+/// 表名由调用方给出（含引用符）。
 pub fn to_insert(
     table: &str,
     columns: &[ResultColumn],
     rows: &[Vec<Value>],
     escape: EscapeStyle,
+    exclude: &[&str],
 ) -> String {
-    if rows.is_empty() {
+    let (columns, rows) = without_columns(columns, rows, exclude);
+    if rows.is_empty() || columns.is_empty() {
         return String::new();
     }
     let cols = columns
@@ -130,6 +168,36 @@ pub fn to_insert(
     }
     out.push_str(";\n");
     out
+}
+
+/// 写出 Excel `.xlsx` 字节；NULL 写空串，其余用 `Value::display()`。
+pub fn to_xlsx(columns: &[ResultColumn], rows: &[Vec<Value>]) -> Result<Vec<u8>, String> {
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let worksheet = workbook.add_worksheet();
+
+    for (col_ix, column) in columns.iter().enumerate() {
+        let col = u16::try_from(col_ix).map_err(|_| "列数超过 Excel 上限".to_string())?;
+        worksheet
+            .write_string(0, col, &column.name)
+            .map_err(|err| err.to_string())?;
+    }
+
+    for (row_ix, row) in rows.iter().enumerate() {
+        let excel_row =
+            u32::try_from(row_ix + 1).map_err(|_| "行数超过 Excel 上限".to_string())?;
+        for (col_ix, _) in columns.iter().enumerate() {
+            let col = u16::try_from(col_ix).map_err(|_| "列数超过 Excel 上限".to_string())?;
+            let text = match row.get(col_ix).unwrap_or(&Value::Null) {
+                Value::Null => String::new(),
+                other => other.display(),
+            };
+            worksheet
+                .write_string(excel_row, col, &text)
+                .map_err(|err| err.to_string())?;
+        }
+    }
+
+    workbook.save_to_buffer().map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -187,10 +255,43 @@ mod tests {
 
     #[test]
     fn insert_renders_literals_and_handles_empty() {
-        let sql = to_insert("`db`.`t`", &columns(), &rows(), EscapeStyle::Backslash);
+        let sql = to_insert("`db`.`t`", &columns(), &rows(), EscapeStyle::Backslash, &[]);
         assert!(sql.starts_with("INSERT INTO `db`.`t` (id, name, note) VALUES"));
         assert!(sql.contains("(1, 'alpha', NULL)"));
         assert!(sql.contains("'含,逗号\"引号'"));
-        assert!(to_insert("t", &columns(), &[], EscapeStyle::Backslash).is_empty());
+        assert!(to_insert("t", &columns(), &[], EscapeStyle::Backslash, &[]).is_empty());
+    }
+
+    #[test]
+    fn insert_excludes_primary_key_columns() {
+        let sql = to_insert(
+            "`db`.`t`",
+            &columns(),
+            &rows(),
+            EscapeStyle::Backslash,
+            &["id"],
+        );
+        assert!(
+            sql.starts_with("INSERT INTO `db`.`t` (name, note) VALUES"),
+            "实际: {sql}"
+        );
+        assert!(sql.contains("('alpha', NULL)"), "实际: {sql}");
+        assert!(!sql.contains("(1,"), "不应再含主键值");
+    }
+
+    #[test]
+    fn select_rows_keeps_order_and_skips_oob() {
+        let picked = select_rows(&rows(), &[1, 99, 0]);
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0][0], Value::Int(2));
+        assert_eq!(picked[1][0], Value::Int(1));
+    }
+
+    #[test]
+    fn xlsx_writes_non_empty_buffer() {
+        let bytes = to_xlsx(&columns(), &rows()).expect("xlsx ok");
+        assert!(bytes.len() > 100, "xlsx 应有实质内容");
+        // ZIP/OOXML 魔数
+        assert_eq!(&bytes[..2], b"PK");
     }
 }
